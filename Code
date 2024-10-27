@@ -1,0 +1,226 @@
+import os
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import Wav2Vec2Processor, Wav2Vec2ForSequenceClassification
+from torch.optim import Adam
+from torch.nn import CrossEntropyLoss
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+import librosa
+import shutil
+
+# Base directory containing the RAVDESS dataset
+base_dir = '/content/drive/MyDrive/RAVDESS_Dataset/RAVDESS_Dataset'
+
+# Emotion map based on the filename's third element
+emotion_map = {
+    1: 'neutral',
+    3: 'happy',
+    4: 'sad',
+    5: 'angry',
+    6: 'fear',
+    7: 'disgust'
+}
+
+# Function to load data from a given directory
+def load_data_from_directory(base_dir, emotion_map):
+    data = []
+    for emotion in emotion_map.values():
+        emotion_dir = os.path.join(base_dir, emotion)
+        if os.path.isdir(emotion_dir):
+            for filename in os.listdir(emotion_dir):
+                if filename.endswith('.wav'):
+                    file_path = os.path.join(emotion_dir, filename)
+                    data.append({'file_path': file_path, 'emotion': emotion})
+    return pd.DataFrame(data)
+
+# Load RAVDESS dataset
+ravdess_data = load_data_from_directory(base_dir, emotion_map)
+
+# Encode emotion labels to numeric values
+label_encoder = LabelEncoder()
+ravdess_data['label'] = label_encoder.fit_transform(ravdess_data['emotion'])
+
+# Split the RAVDESS dataset into training and testing sets
+train_data, test_data = train_test_split(ravdess_data, test_size=0.1, random_state=42)
+
+# Proceed with the training process using train_data and test_data
+
+
+class SERDataset(Dataset):
+    def __init__(self, dataframe, processor):
+        self.dataframe = dataframe
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        file_path = self.dataframe.iloc[idx, 0]
+        label = self.dataframe.iloc[idx, 2]
+        audio, _ = librosa.load(file_path, sr=16000)
+        processed_audio = self.processor(audio, sampling_rate=16000, return_tensors="pt", padding=True)
+        return processed_audio.input_values.squeeze(), torch.tensor(label)
+
+
+def collate_fn(batch):
+    inputs, labels = zip(*batch)
+    processed_inputs = [processor(inp, sampling_rate=16000, return_tensors="pt", padding=True) for inp in inputs]
+    max_length = max([inp['input_values'].shape[1] for inp in processed_inputs])
+    padded_inputs = [torch.nn.functional.pad(inp['input_values'], (0, max_length - inp['input_values'].shape[1])) for inp in processed_inputs]
+    processed_inputs = torch.stack(padded_inputs)
+    return processed_inputs.squeeze(), torch.tensor(labels)
+
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+
+train_dataset = SERDataset(train_data, processor)
+test_dataset = SERDataset(test_data, processor)
+
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
+test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+
+model = Wav2Vec2ForSequenceClassification.from_pretrained("facebook/wav2vec2-base-960h", num_labels=len(label_encoder.classes_))
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# Define optimizer and loss function
+optimizer = Adam(model.parameters(), lr=1e-5)
+criterion = CrossEntropyLoss()
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score
+import numpy as np
+
+# Initialize lists to store metrics
+train_losses = []
+val_losses = []
+val_accuracies = []
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, verbose=True)
+num_epochs = 100
+early_stopping_patience = 5
+best_val_loss = float('inf')
+early_stopping_counter = 0
+
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    for batch in train_loader:
+        inputs, labels = batch
+        inputs, labels = inputs.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(inputs).logits
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+
+    avg_train_loss = running_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+
+    # Validation phase
+    model.eval()
+    val_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            inputs, labels = batch
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            outputs = model(inputs).logits
+            loss = criterion(outputs, labels)
+            val_loss += loss.item()
+
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    avg_val_loss = val_loss / len(test_loader)
+    val_accuracy = accuracy_score(all_labels, all_preds)
+    val_losses.append(avg_val_loss)
+    val_accuracies.append(val_accuracy)
+
+    print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
+
+    # Check for early stopping
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        early_stopping_counter = 0
+        # Save the best model
+        torch.save(model.state_dict(), 'best_model.pth')
+    else:
+        early_stopping_counter += 1
+        if early_stopping_counter >= early_stopping_patience:
+            print("Early stopping triggered")
+            break
+
+    # Adjust learning rate
+    scheduler.step(avg_val_loss)
+
+print("Training complete!")
+
+# Load the best model
+model.load_state_dict(torch.load('best_model.pth'))
+
+# Evaluate on the test set
+model.eval()
+all_preds = []
+all_labels = []
+
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+
+        outputs = model(inputs).logits
+        preds = torch.argmax(outputs, dim=1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+# Calculate accuracy
+accuracy = accuracy_score(all_labels, all_preds)
+print(f"Test Accuracy: {accuracy:.4f}")
+
+# Plot Training and Validation Loss
+plt.figure(figsize=(12, 6))
+
+plt.subplot(1, 2, 1)
+plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss')
+plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss')
+plt.legend()
+
+# Plot Validation Accuracy
+plt.subplot(1, 2, 2)
+plt.plot(range(1, len(val_accuracies) + 1), val_accuracies, label='Validation Accuracy', color='orange')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Validation Accuracy')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig('training_validation_plots.png')
+plt.show()
+
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+# Calculate accuracy
+accuracy = accuracy_score(all_labels, all_preds)
+print(f"Test Accuracy: {accuracy:.4f}")
+
+# Calculate confusion matrix
+conf_matrix = confusion_matrix(all_labels, all_preds)
+
+# Plot confusion matrix
+plt.figure(figsize=(10, 8))
+sns.heatmap(conf_matrix, annot=True, fmt="d", cmap="Blues")
+plt.xlabel('Predicted Labels')
+plt.ylabel('True Labels')
+plt.title('Confusion Matrix')
+plt.show()
